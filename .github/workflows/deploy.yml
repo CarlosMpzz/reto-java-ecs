@@ -1,1 +1,175 @@
 
+name: Java en ECS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - pom.xml
+      - Dockerfile
+      - .dockerignore
+      - infra/**
+      - .github/workflows/deploy.yml
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operación
+        type: choice
+        options: [deploy, destroy]
+        default: deploy
+
+concurrency:
+  group: reto-java-ecs
+  cancel-in-progress: false
+
+jobs:
+  ecs:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      OPERATION: ${{ inputs.operation || 'deploy' }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_execution_role_arn: ${{ vars.AWS_TASK_EXECUTION_ROLE_ARN }}
+      TF_VAR_app_revision: ${{ github.sha }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verificar variables del repositorio
+        shell: bash
+        run: |
+          : "${TF_VAR_aws_region:?Crea la variable AWS_REGION}"
+          : "${TF_STATE_BUCKET:?Crea la variable TF_STATE_BUCKET}"
+          : "${TF_VAR_execution_role_arn:?Crea la variable AWS_TASK_EXECUTION_ROLE_ARN}"
+
+      - name: Autenticar en AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: reto-${{ github.run_id }}
+          role-skip-session-tagging: true
+
+      - name: Verificar cuenta y acceso al estado de Terraform
+        shell: bash
+        run: |
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          [[ "$TF_VAR_execution_role_arn" == "arn:aws:iam::$account_id:role/"* ]]
+          aws s3api head-bucket --bucket "$TF_STATE_BUCKET" --expected-bucket-owner "$account_id"
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.14.0
+          terraform_wrapper: false
+
+      - name: Inicializar Terraform
+        shell: bash
+        run: |
+          terraform fmt -check -recursive infra
+          for stack in registry service; do
+            terraform -chdir="infra/$stack" init \
+              -backend-config="bucket=$TF_STATE_BUCKET" \
+              -backend-config="region=$TF_VAR_aws_region"
+            terraform -chdir="infra/$stack" validate
+          done
+
+      - name: Crear el repositorio ECR
+        if: env.OPERATION == 'deploy'
+        run: terraform -chdir=infra/registry apply -auto-approve
+
+      - name: Compilar con Maven, probar y publicar la imagen
+        id: image
+        if: env.OPERATION == 'deploy'
+        shell: bash
+        run: |
+          repository="$(terraform -chdir=infra/registry output -raw repository_url)"
+          registry="${repository%%/*}"
+          repository_name="${repository#*/}"
+          image_tag="$repository:$GITHUB_SHA"
+
+          image_digest() {
+            aws ecr describe-images --repository-name "$repository_name" \
+              --image-ids "imageTag=$GITHUB_SHA" --query 'imageDetails[0].imageDigest' --output text
+          }
+
+          if ! digest="$(image_digest 2>&1)"; then
+            if [[ "$digest" != *ImageNotFoundException* ]]; then
+              printf '%s\n' "$digest" >&2
+              exit 1
+            fi
+
+            docker build --platform linux/amd64 --tag "$image_tag" .
+            container="$(docker run --detach --publish 127.0.0.1::8080 "$image_tag")"
+            trap 'docker rm --force "$container" >/dev/null' EXIT
+            address="$(docker port "$container" 8080/tcp)"
+            test "$(curl -fsS --max-time 5 --retry 10 --retry-delay 1 --retry-all-errors "http://$address/health")" = OK
+            test "$(curl -fsS --max-time 5 "http://$address/")" = "Hola mundo desde AWS ECS"
+
+            aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
+            docker push "$image_tag"
+            digest="$(image_digest)"
+          fi
+
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'uri=%s@%s\n' "$repository" "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Desplegar el servicio en ECS Fargate
+        if: env.OPERATION == 'deploy'
+        env:
+          TF_VAR_image_uri: ${{ steps.image.outputs.uri }}
+        run: terraform -chdir=infra/service apply -auto-approve
+
+      - name: Verificar el servicio público y mostrar su URL
+        if: env.OPERATION == 'deploy'
+        shell: bash
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+        run: |
+          url="$(terraform -chdir=infra/service output -raw endpoint_url)"
+          cluster="$(terraform -chdir=infra/service output -raw cluster_name)"
+          service="$(terraform -chdir=infra/service output -raw service_name)"
+          expected_task="$(terraform -chdir=infra/service output -raw task_definition_arn)"
+          deployment="$(aws ecs describe-services --cluster "$cluster" --services "$service" \
+            --query 'services[0].deployments[?status==`PRIMARY`] | [0].[taskDefinition, rolloutState]' --output text)"
+          read -r active_task rollout_state <<< "$deployment"
+
+          if [[ "$active_task" != "$expected_task" || "$rollout_state" != COMPLETED ]]; then
+            echo "::error::ECS no activó la revisión solicitada. Revisa los eventos del servicio."
+            exit 1
+          fi
+
+          test "$(curl -fsS --max-time 10 --retry 12 --retry-delay 5 --retry-all-errors "$url/health")" = OK
+          test "$(curl -fsS --max-time 10 "$url/")" = "Hola mundo desde AWS ECS"
+          test "$(curl -fsS --max-time 10 "$url/version")" = "$GITHUB_SHA"
+
+          {
+            printf '### Servicio ECS verificado\n\n'
+            printf -- '- [Abrir aplicación](%s)\n' "$url"
+            printf -- '- [Verificar salud](%s/health)\n' "$url"
+            printf -- '- [Verificar revisión](%s/version)\n' "$url"
+            printf -- '- Imagen ECR: `%s`\n' "$IMAGE_URI"
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Eliminar el servicio y el repositorio ECR del reto
+        if: env.OPERATION == 'destroy'
+        env:
+          TF_VAR_image_uri: unused-for-destroy
+        run: |
+          terraform -chdir=infra/service destroy -auto-approve
+          terraform -chdir=infra/registry destroy -auto-approve
